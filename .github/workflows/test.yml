@@ -1,0 +1,41 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Threads can change its page layout at any time; a weekly run surfaces
+  # breakage before users hit it.
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp ruff
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests (offline)
+        run: python -m unittest discover -s tests -v
+      - name: Plugin loads in yt-dlp
+        run: |
+          mkdir -p ~/.config/yt-dlp/plugins/yt-dlp-threads
+          cp -r yt_dlp_plugins ~/.config/yt-dlp/plugins/yt-dlp-threads/
+          yt-dlp --verbose --simulate "https://www.threads.com/@x/post/y" 2>&1 \
+            | grep -q "Extractor Plugins: ThreadsIE" \
+            || { echo "::error::plugin did not load"; exit 1; }
