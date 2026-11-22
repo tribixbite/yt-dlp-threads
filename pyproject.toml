@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yt-dlp-threads"
-version = "0.1.0"
+version = "0.2.0"
 description = "yt-dlp extractor plugin for Threads (threads.com / threads.net)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "Unlicense" }
 authors = [{ name = "tribixbite" }]
 keywords = ["yt-dlp", "yt-dlp-plugin", "threads", "instagram", "downloader", "video"]
@@ -32,3 +32,17 @@ Issues = "https://github.com/tribixbite/yt-dlp-threads/issues"
 [tool.setuptools.packages.find]
 include = ["yt_dlp_plugins*"]
 namespaces = true
+
+# Rules are listed explicitly: ruff's default rule set changes between
+# releases (0.17 started flagging RUF/FURB rules that 0.15 did not), which
+# turned the weekly CI run red with no code change. CI also pins ruff.
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "RUF", "FURB", "SLF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests drive the extractor through its private hooks on purpose.
+"tests/*" = ["SLF001"]

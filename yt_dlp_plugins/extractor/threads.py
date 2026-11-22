@@ -11,6 +11,11 @@ A post page embeds *many* posts (thread items, replies, recommendations), so
 the target is selected by its shortcode (`code`). Guessing "the first video on
 the page" is not safe: it silently yields an unrelated recommended clip.
 
+A Threads post can also carry its video indirectly: a text post that embeds
+an Instagram reel (`text_post_app_info.linked_inline_media`), a repost, or a
+quote of another post (`text_post_app_info.share_info`). When the post itself
+has no video, those embedded media are tried in that order.
+
 Caveat: this bypass is inherently fragile. If Meta stops serving crawlers the
 full payload, or reshuffles the embedded JSON, extraction will break. There is
 no cookie/auth support — only publicly viewable posts work.
@@ -19,10 +24,12 @@ no cookie/auth support — only publicly viewable posts work.
 import base64
 import json
 import re
+from typing import ClassVar
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import (
     ExtractorError,
+    float_or_none,
     int_or_none,
     parse_qs,
     str_or_none,
@@ -35,6 +42,21 @@ _MEDIA_KEYS = {'video_versions', 'video_dash_manifest', 'image_versions2', 'caro
 # media_type values seen in the post JSON.
 _MEDIA_TYPE_IMAGE = 1
 _MEDIA_TYPE_CAROUSEL = 8
+# Where a post that has no media of its own keeps the media it points at,
+# as (traversal path under the post, human-readable label, take_metadata).
+# Checked in order. take_metadata: the embedded post is the real content, so
+# its author/caption/timestamp replace the wrapping post's.
+#  - linked_inline_media: an Instagram reel/post embedded in a text post (the
+#    "attached reel" card). Seen live: media_type 19 post -> media_type 2 reel.
+#  - reposted_post: a plain repost; the whole post is someone else's.
+#  - quoted_post / quoted_attachment_post: a quote post; the video belongs to
+#    the quoted post, the text to the quoting one.
+_EMBEDDED_MEDIA_PATHS = (
+    (('text_post_app_info', 'linked_inline_media'), 'linked Instagram media', False),
+    (('text_post_app_info', 'share_info', 'reposted_post'), 'reposted post', True),
+    (('text_post_app_info', 'share_info', 'quoted_post'), 'quoted post', False),
+    (('text_post_app_info', 'share_info', 'quoted_attachment_post'), 'quoted attachment', False),
+)
 
 
 class ThreadsIE(InfoExtractor):
@@ -45,7 +67,7 @@ class ThreadsIE(InfoExtractor):
             (?:@(?P<user>[^/?#]+)/post|t)/(?P<id>[\w-]+)
             |share/(?P<share>[\w-]+)
         )'''
-    _TESTS = [{
+    _TESTS: ClassVar[list[dict]] = [{
         'url': 'https://www.threads.com/@kfury/post/DaGcWDwj8tW',
         'info_dict': {
             'id': 'DaGcWDwj8tW',
@@ -55,6 +77,20 @@ class ThreadsIE(InfoExtractor):
             'uploader_url': 'https://www.threads.com/@kfury',
             'timestamp': int,
             'upload_date': str,
+        },
+        'params': {'skip_download': True},
+    }, {
+        # Text post whose video is an embedded Instagram reel
+        # (text_post_app_info.linked_inline_media)
+        'url': 'https://www.threads.com/share/BBkykdNbKs',
+        'info_dict': {
+            'id': 'DgArqLFkbE2',
+            'ext': 'mp4',
+            'title': str,
+            'uploader_id': 'gjarca17',
+            'timestamp': int,
+            'upload_date': str,
+            'duration': int,
         },
         'params': {'skip_download': True},
     }, {
@@ -83,7 +119,7 @@ class ThreadsIE(InfoExtractor):
     def _extract_posts(self, webpage, video_id):
         posts = []
         for block in re.findall(
-                r'<script type="application/json"[^>]*>(.*?)</script>', webpage, re.S):
+                r'<script type="application/json"[^>]*>(.*?)</script>', webpage, re.DOTALL):
             # errnote=False: pages carry unrelated JSON blobs; a parse failure
             # in one is normal and must not spam warnings.
             data = self._parse_json(block, video_id, fatal=False, errnote=False)
@@ -152,9 +188,10 @@ class ThreadsIE(InfoExtractor):
         formats = self._formats_from_media(media, item_id)
         if not formats:
             return None
-        # Duration lives only in the CDN URL's efg blob.
-        duration = None
-        for fmt in formats:
+        # Instagram media (e.g. a linked reel) carries video_duration; native
+        # Threads video only exposes it in the CDN URL's efg blob.
+        duration = int_or_none(float_or_none(media.get('video_duration')))
+        for fmt in formats if not duration else ():
             duration = int_or_none(self._efg_info(fmt['url']).get('duration_s'))
             if duration:
                 break
@@ -174,23 +211,28 @@ class ThreadsIE(InfoExtractor):
         mobj = self._match_valid_url(url)
         matched_id = mobj.group('id') or mobj.group('share')
 
-        webpage = self._download_webpage(
+        webpage, urlh = self._download_webpage_handle(
             url, matched_id, note='Downloading post webpage (crawler UA)',
             headers={'User-Agent': _GOOGLEBOT_UA})
 
         # Determine the target shortcode. Canonical URLs carry it; /share/ and
-        # /t/ links only reveal it through the canonical og:url on the page.
+        # /t/ links only reveal it through the canonical og:url on the page,
+        # or through the URL the share link redirected to.
         target_code = mobj.group('id')
         if not target_code:
-            target_code = self._search_regex(
-                r'/post/([\w-]+)',
-                self._og_search_property('url', webpage, default='') or '',
-                'post id', default=None)
+            for candidate in (self._og_search_property('url', webpage, default=None),
+                              getattr(urlh, 'url', None)):
+                target_code = self._search_regex(
+                    r'/post/([\w-]+)', candidate or '', 'post id', default=None)
+                if target_code:
+                    break
 
         posts = self._extract_posts(webpage, matched_id)
         if target_code:
-            post = next((p for p in posts if p.get('code') == target_code), None)
-            if post is None:
+            # The same post can be embedded more than once (e.g. a bare copy in
+            # a related-posts list); every copy is tried, in page order.
+            candidates = [p for p in posts if p.get('code') == target_code]
+            if not candidates:
                 # Never fall back here: the page is full of unrelated
                 # recommended posts and picking one yields the wrong video.
                 raise ExtractorError(
@@ -198,19 +240,73 @@ class ThreadsIE(InfoExtractor):
                     'deleted, private, login-gated, or Threads changed its layout.',
                     expected=True)
         else:
-            post = next((p for p in posts if p.get('video_versions')
-                         or p.get('video_dash_manifest')), None)
-            if post is None:
+            candidates = [next((p for p in posts if p.get('video_versions')
+                                or p.get('video_dash_manifest')), None)]
+            if candidates[0] is None:
                 raise ExtractorError(
                     'No video post found on this page.', expected=True)
             self.report_warning(
                 'Could not determine which post this link points to; using the first '
                 'video on the page. Pass the canonical @user/post/<id> URL to be sure.')
 
+        for post in candidates:
+            result = self._resolve_post(post, target_code or matched_id, url, mobj.group('user'))
+            if result:
+                return result
+
+        post = candidates[0]
         video_id = post.get('code') or target_code or matched_id
+        kind = ('an image post' if post.get('media_type') == _MEDIA_TYPE_IMAGE
+                else 'a carousel with no videos; images are not supported'
+                if post.get('media_type') == _MEDIA_TYPE_CAROUSEL
+                else 'text-only or unsupported')
+        raise ExtractorError(
+            f'Post "{video_id}" has no downloadable video ({kind})', expected=True)
+
+    def _resolve_post(self, post, fallback_id, url, url_user):
+        """Return the info dict for `post`'s own video, else for embedded media.
+
+        Returns None when neither the post nor anything it embeds has a video.
+        """
+        video_id = post.get('code') or fallback_id
+        result = self._post_result(post, video_id, url, url_user)
+        if result:
+            return result
+
+        # The post has no media of its own; it may embed someone else's.
+        for path, label, take_metadata in _EMBEDDED_MEDIA_PATHS:
+            embedded = traverse_obj(post, (*path, {dict}))
+            if not embedded:
+                continue
+            if take_metadata:
+                # A repost is the original post wholesale, so resolve it as
+                # one: it may itself be a text post with a linked reel.
+                result = self._resolve_post(embedded, video_id, url, url_user)
+            else:
+                result = self._post_result(
+                    post, video_id, url, url_user, media_post=embedded)
+            if result:
+                self.to_screen(
+                    f'{video_id}: Post has no video of its own; downloading its {label}'
+                    + (f' ({embedded["code"]})' if embedded.get('code') else ''))
+                return result
+        return None
+
+    def _post_result(self, post, video_id, url, url_user, media_post=None):
+        """Build the info dict for `post`, taking the video from `media_post`.
+
+        media_post defaults to the post itself. For embedded media (linked
+        reel, quote) the Threads post supplies the metadata and the embedded
+        media only the video; caption falls back to the embedded one.
+        Returns None when media_post holds no downloadable video (including an
+        image-only carousel).
+        """
+        media_post = media_post or post
         user = post.get('user') or {}
-        caption = traverse_obj(post, ('caption', 'text')) or post.get('accessibility_caption')
-        uploader_id = user.get('username') or mobj.group('user')
+        caption = (traverse_obj(post, ('caption', 'text'))
+                   or post.get('accessibility_caption')
+                   or traverse_obj(media_post, ('caption', 'text')))
+        uploader_id = user.get('username') or url_user
         common = {
             'description': caption,
             'uploader': user.get('full_name') or uploader_id,
@@ -223,7 +319,7 @@ class ThreadsIE(InfoExtractor):
         title = (caption or '').split('\n')[0][:72] or (
             f'Threads video by {uploader_id}' if uploader_id else f'Threads video {video_id}')
 
-        carousel = post.get('carousel_media')
+        carousel = media_post.get('carousel_media')
         if isinstance(carousel, list) and carousel:
             entries = []
             for idx, item in enumerate(carousel):
@@ -233,22 +329,16 @@ class ThreadsIE(InfoExtractor):
                     entry['title'] = f'{title} (part {idx + 1})'
                     entries.append(entry)
             if not entries:
-                raise ExtractorError(
-                    'This carousel post contains no videos (images are not supported)',
-                    expected=True)
+                return None  # image-only carousel; the caller reports it
             if len(entries) == 1:
                 return entries[0]
             return self.playlist_result(
                 entries, playlist_id=video_id, playlist_title=title,
                 playlist_description=caption, multi_video=True)
 
-        entry = self._media_entry(post, video_id)
+        entry = self._media_entry(media_post, video_id)
         if entry is None:
-            kind = ('an image post' if post.get('media_type') == _MEDIA_TYPE_IMAGE
-                    else 'a carousel' if post.get('media_type') == _MEDIA_TYPE_CAROUSEL
-                    else 'text-only or unsupported')
-            raise ExtractorError(
-                f'Post "{video_id}" has no downloadable video ({kind})', expected=True)
+            return None
         entry.update(common)
         entry['title'] = title
         return entry
